@@ -54,6 +54,7 @@
 #include "clang/CodeGen/ObjectFilePCHContainerOperations.h"
 #include "clang/Frontend/FrontendActions.h"
 #include "clang/Frontend/Utils.h"
+#include "clang/Driver/Driver.h"
 #include "clang/Index/IndexingAction.h"
 #include "clang/Lex/Preprocessor.h"
 #include "clang/Lex/PreprocessorOptions.h"
@@ -73,6 +74,7 @@
 #include "llvm/Support/Path.h"
 #include "llvm/Support/YAMLParser.h"
 #include "llvm/Support/YAMLTraits.h"
+#include "llvm/Support/VirtualFileSystem.h"
 #include <algorithm>
 #include <memory>
 
@@ -693,14 +695,6 @@ importer::getNormalInvocationArguments(
     } else {
       // FIXME: Emit a warning of some kind.
     }
-
-    if (EnableCXXInterop) {
-      if (auto path =
-              getLibStdCxxModuleMapPath(searchPathOpts, triple, buffer)) {
-        invocationArgStrs.push_back(
-            (Twine("-fmodule-map-file=") + *path).str());
-      }
-    }
   }
 
   if (searchPathOpts.getSDKPath().empty()) {
@@ -868,6 +862,90 @@ importer::addCommonInvocationArguments(
   for (auto extraArg : importerOpts.ExtraArgs) {
     invocationArgStrs.push_back(extraArg);
   }
+}
+
+/// On Linux, some platform libraries (glibc, libstdc++) are not modularized.
+/// We provide a modulemap for those libraries to allow using them from Swift.
+static SmallVector<std::pair<std::string, std::string>>
+getClangInvocationFileMapping(ASTContext &ctx) {
+  const llvm::Triple &triple = ctx.LangOpts.Target;
+  // For now we only need this when building for Linux.
+  if (!triple.isOSLinux())
+    return {};
+
+  SearchPathOptions &searchPathOpts = ctx.SearchPathOpts;
+
+  SmallString<128> SDKPath(searchPathOpts.getSDKPath());
+  if (SDKPath.empty()) {
+    SDKPath = "/";
+  }
+
+  if (!ctx.LangOpts.EnableCXXInterop)
+    return {};
+
+  SmallString<128> ModuleMapRPath;
+  SmallString<128> ModuleMapVPath;
+
+  // The module map used for Glibc depends on the target we're compiling for,
+  // and is not included in the resource directory with the other implicit
+  // module maps. It's at {freebsd|linux}/{arch}/glibc.modulemap.
+  SmallString<128> buffer;
+  if (auto path = getLibStdCxxModuleMapPath(searchPathOpts, triple, buffer)) {
+    ModuleMapRPath = path.getValue();
+  } else
+    return {};
+
+  SmallString<128> HeaderRPath = ModuleMapRPath;
+  llvm::sys::path::remove_filename(HeaderRPath);
+  llvm::sys::path::append(HeaderRPath, "libstdcxx.h");
+
+  // Only overlay the module map if that file actually exists.
+  // It may not -- for example if
+  // `swiftc -target x86_64-unknown-linux-gnu -emit-ir` is invoked using
+  // a Swift compiler not built for Linux targets.
+  if (!llvm::sys::fs::exists(ModuleMapRPath))
+    // FIXME: Emit a warning of some kind.
+    return {};
+
+  SmallString<128> cxxStdlibsRoot(SDKPath);
+  llvm::sys::path::append(cxxStdlibsRoot, "usr/include/c++");
+  if (!llvm::sys::fs::exists(cxxStdlibsRoot))
+    return {};
+
+  // Collect all installed versions of libstdc++.
+  SmallVector<SmallString<128>, 1> cxxStdlibDirs;
+  std::error_code errorCode;
+  for (llvm::vfs::directory_iterator
+           iter = ctx.SourceMgr.getFileSystem()->dir_begin(cxxStdlibsRoot,
+                                                           errorCode),
+           endIter;
+       !errorCode && iter != endIter; iter = iter.increment(errorCode)) {
+    cxxStdlibDirs.push_back(SmallString<128>(iter->path()));
+  }
+
+  SmallVector<std::pair<std::string, std::string>> result;
+  // Insert a modulemap into the VFS of each of the libstdc++ installations.
+  for (const auto &cxxStdlibDir : cxxStdlibDirs) {
+    // Only overlay the module map if we don't have real
+    // {sysroot}/usr/include/module.{map,modulemap}.
+    // FIXME: command line option?
+    ModuleMapVPath = cxxStdlibDir;
+    llvm::sys::path::append(ModuleMapVPath,"module.modulemap");
+    if (llvm::sys::fs::exists(ModuleMapVPath))
+      continue;
+
+    ModuleMapVPath = cxxStdlibDir;
+    llvm::sys::path::append(ModuleMapVPath, "module.map");
+    if (llvm::sys::fs::exists(ModuleMapVPath))
+      continue;
+
+    SmallString<128> HeaderVPath = SDKPath;
+    llvm::sys::path::append(HeaderVPath, "libstdcxx.h");
+
+    result.push_back({std::string(ModuleMapVPath), std::string(ModuleMapRPath)});
+    result.push_back({std::string(HeaderVPath), std::string(HeaderRPath)});
+  }
+  return result;
 }
 
 bool ClangImporter::canReadPCH(StringRef PCHFilename) {
@@ -1122,9 +1200,10 @@ ClangImporter::create(ASTContext &ctx,
     }
   }
 
+  auto fileMapping = getClangInvocationFileMapping(ctx);
   // Wrap Swift's FS to allow Clang to override the working directory
   llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> VFS =
-      llvm::vfs::RedirectingFileSystem::create({}, true,
+      llvm::vfs::RedirectingFileSystem::create(fileMapping, true,
                                                *ctx.SourceMgr.getFileSystem());
 
   // Create a new Clang compiler invocation.
